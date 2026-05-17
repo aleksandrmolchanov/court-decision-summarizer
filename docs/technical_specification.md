@@ -1,6 +1,6 @@
 # Technical Specification: Court Decision Summarizer (MVP)
 
-**Document version:** 1.0  
+**Document version:** 1.1  
 **Status:** Approved for development  
 **Last updated:** 2026-05-15
 
@@ -33,8 +33,9 @@
 | **Product type** | Local web application (MVP) |
 | **Target user** | Lawyer or legal professional |
 | **MVP goal** | Paste or type a court decision text, receive a structured summary built from configurable blocks, refine it via dialog, browse case history, and review usage statistics |
-| **UI language** | English (all labels, system messages, validation errors) |
-| **Content language** | Input and generated summaries are primarily Russian (Russian Federation court decisions); LLM prompts are configurable; default generation language is Russian |
+| **UI chrome language** | English (navigation, buttons, settings labels, static confirmations) |
+| **Case language** | Dominant language of the court decision text; drives Summary language for the entire Case |
+| **Dialog language** | Language of App messages in the Dialog; defaults to Case language; follows the User when they switch language in chat |
 
 ### 1.2. Business objective
 
@@ -52,6 +53,8 @@ Deliver a minimum viable product (MVP) that runs locally on the user's computer,
 | **Summary paragraph** | One paragraph in the Summary panel, corresponding to one active **Summary block** from Settings |
 | **Summary block** | Configuration entity defining a section of the Summary (name, LLM instruction, active flag, sort order). Internal entity name: `response_block` |
 | **Template** | Saved text snippet that can be appended to a Summary paragraph |
+| **Case language** | Dominant language of the court decision; fixed for the Case; language of the Summary |
+| **Dialog language** | Language used for App messages in the Dialog; adapts when the User switches language |
 | **LLM provider** | External or local language model accessed through an abstract adapter |
 
 ### 1.4. MVP constraints
@@ -62,7 +65,41 @@ Deliver a minimum viable product (MVP) that runs locally on the user's computer,
 - **Optional (not in acceptance criteria):** macOS.
 - **Browsers:** Latest stable Chrome, Firefox, Edge.
 
-### 1.5. UI navigation (English labels)
+### 1.5. Language policy
+
+The App distinguishes three language layers:
+
+| Layer | Scope | Rule |
+|-------|-------|------|
+| **UI chrome** | Menus, section names, buttons, Settings forms | Fixed **English** (Section 4.1.5) |
+| **Case language** | Court decision source text and **Summary** | Detected once from the initial court decision input (ISO 639-1 code, e.g. `ru`, `en`). **Summary MUST always be generated and updated in Case language**, regardless of Dialog language changes. |
+| **Dialog language** | App-authored messages in the Dialog (clarifications, “summary ready”, refinement replies) | Initially equals **Case language**. When the User writes a message predominantly in another language, the App MUST switch **Dialog language** to that language for subsequent App messages. |
+
+#### 1.5.1. Case language detection
+
+- Run on the first successful validation input (full court decision text).
+- Use automatic language detection (library or LLM); store as `case.language` (BCP 47 or ISO 639-1).
+- If detection is ambiguous (mixed text), prefer the language of the dispositive / introductory judicial phrases; log confidence.
+- `case.language` MUST NOT change when the User switches Dialog language mid-case.
+
+#### 1.5.2. Dialog language adaptation
+
+- After each **user** Dialog message, detect the message language.
+- If the detected language differs from `case.dialog_language`, update `case.dialog_language` to the new language.
+- All new App Dialog messages (validation clarifications, status messages, `refine` replies) MUST be produced in `case.dialog_language`.
+- Prior messages in the thread are not rewritten when Dialog language changes.
+
+#### 1.5.3. Summary language
+
+- Summarize and refine prompts MUST instruct the model to write Summary paragraphs **only** in `case.language`.
+- Template text is stored as authored; applying a Template does not change Case language.
+
+#### 1.5.4. Prompts and LLM instructions
+
+- Summary block **Instructions** in Settings may be written in any language; the model MUST still output Summary text in `case.language`.
+- Prompt templates receive `{{case_language}}` and `{{dialog_language}}` variables.
+
+### 1.6. UI navigation (English labels)
 
 The main navigation exposes four sections:
 
@@ -188,6 +225,8 @@ Directories `data/` and `.env` MUST be listed in `.gitignore`.
 | `source_preview` | string | First ~80 characters of initial court decision |
 | `summary_text` | text | Full Summary (`\n\n` between paragraphs) |
 | `summary_user_edited` | boolean | True if User edited Summary manually or via template |
+| `language` | string | Case language (ISO 639-1); set from court decision, immutable |
+| `dialog_language` | string | Current Dialog language for App messages; defaults to `language` |
 | `status` | enum | `active`, `summary_ready`, etc. |
 
 #### Dialog message
@@ -239,7 +278,7 @@ Directories `data/` and `.env` MUST be listed in `.gitignore`.
 2. User pastes or types the court decision text and clicks **Send**.
 3. App runs **input validation** (Section 5).
    - If insufficient: App posts a clarification message in the Dialog listing what is missing; Summary is **not** generated.
-   - If sufficient: App generates Summary and posts a short Dialog message (e.g. **"Summary is ready."**) without duplicating the full Summary in the chat unless configured otherwise.
+   - If sufficient: App sets `case.language`, sets `dialog_language` = `language`, generates Summary in `case.language`, and posts a short Dialog message in `dialog_language` (see Section 4.1.5) without duplicating the full Summary in the chat unless configured otherwise.
 4. Summary panel displays **N** paragraphs—one per active Summary block, in `sort_order`, with no headings.
 
 #### 4.1.3. Dialog continuation
@@ -258,6 +297,8 @@ The App MUST:
 
 When the User edits Summary text directly in the panel, the App MUST persist changes immediately (debounced save acceptable, max 2 s delay) and set `summary_user_edited = true`.
 
+Before processing each User Dialog message, the App MUST detect its language and update `dialog_language` if it differs (Section 1.5.2). LLM refinement replies use the updated `dialog_language`; Summary updates remain in `case.language`.
+
 #### 4.1.4. Apply template
 
 1. User clicks **Apply template** on a paragraph.
@@ -268,17 +309,30 @@ When the User edits Summary text directly in the panel, the App MUST persist cha
    - If paragraph is empty: insert Template text only.
 5. App sets `summary_user_edited = true` and persists.
 
-#### 4.1.5. Key UI strings (English)
+#### 4.1.5. UI chrome strings (English)
+
+Static interface copy (not Dialog content):
 
 | Key | Text |
 |-----|------|
 | `send` | Send |
 | `new_case` | New case |
-| `summary_ready` | Summary is ready. |
 | `apply_template` | Apply template |
 | `search_templates` | Search templates… |
 | `confirm_new_case` | Start a new case? The current case will be saved to history. |
 | `confirm_new_case_unsaved` | You have unsent text. Start a new case anyway? |
+
+#### 4.1.6. Localized Dialog messages (by `dialog_language`)
+
+App-generated Dialog text MUST use `dialog_language`. Provide built-in strings per supported language (MVP: `ru`, `en`; extend as needed) or generate via LLM with a fixed intent key.
+
+| Key | `en` | `ru` |
+|-----|------|------|
+| `summary_ready` | Summary is ready. | Резюме готово. |
+| `validation_not_decision` | The text does not appear to be a court decision. | Текст не похож на судебное решение. |
+| `llm_error` | Could not get a response. Please try again. | Не удалось получить ответ. Попробуйте ещё раз. |
+
+Clarification lists from validation (`missing_items`) MUST be produced in `dialog_language` (validator prompt receives `{{dialog_language}}`; on first message equals detected `case.language`).
 
 ### 4.2. Case history
 
@@ -392,7 +446,7 @@ Input is **sufficient** only if **all** of the following hold:
 ### 5.2. Document type
 
 - LLM classifier returns `is_court_decision: true`.
-- If `is_court_decision: false`, validation fails with a user-facing explanation (e.g. **"The text does not appear to be a court decision."**).
+- If `is_court_decision: false`, validation fails with a user-facing explanation in `dialog_language` (e.g. key `validation_not_decision` in Section 4.1.6).
 
 ### 5.3. Structural completeness
 
@@ -408,7 +462,7 @@ The validator returns JSON. All of the following structural checks MUST pass (or
 ### 5.4. Insufficient input behavior
 
 - App MUST NOT call the summarize prompt.
-- App posts a Dialog message listing **1–5** specific missing items in English.
+- App posts a Dialog message listing **1–5** specific missing items in `dialog_language` (initially equal to detected `case.language`).
 - App logs `clarification_requested`.
 - User reply triggers re-validation; append new text to Case source context before re-checking.
 
@@ -458,12 +512,14 @@ sequenceDiagram
 - Paragraphs separated by exactly `\n\n`.
 - No headings, labels, or block names in the output text.
 - Each paragraph MUST follow the corresponding block's **Instruction**.
+- All paragraph text MUST be in **`case.language`** (Case language).
 
 ### 6.3. Refine behavior
 
-- Input: full Dialog history (or sliding window with system summary if token limits apply), current `summary_text`, `summary_user_edited` flag, active Summary blocks.
-- Output: JSON with `dialog_reply` (string) and optional `summary_text` (full updated Summary, same paragraph rules).
+- Input: full Dialog history (or sliding window with system summary if token limits apply), current `summary_text`, `summary_user_edited` flag, active Summary blocks, `case.language`, `dialog_language`.
+- Output: JSON with `dialog_reply` (string, in **`dialog_language`**) and optional `summary_text` (full updated Summary in **`case.language`**, same paragraph rules).
 - If User manually edited Summary, refinement MUST preserve User intent and merge changes rather than blind overwrite.
+- Changing `dialog_language` mid-case MUST NOT change `case.language` or the language of existing Summary paragraphs unless the User explicitly requests translation (out of scope for MVP unless added later).
 
 ### 6.4. Logging
 
@@ -545,6 +601,9 @@ Base path: `/api`. All responses JSON unless noted. Errors: `{ "error": { "code"
 | AC-10 | Templates: CRUD; Apply template with search appends text to paragraph |
 | AC-11 | Statistics show token usage and timing events per Case and for a selected period |
 | AC-12 | Changing `LLM_MODEL` / `LLM_BASE_URL` in `.env` and restarting changes the model without code changes to Case logic |
+| AC-13 | Russian court decision → Summary and initial Dialog messages in Russian |
+| AC-14 | User continues Dialog in English → subsequent App Dialog messages in English; Summary remains in Case language |
+| AC-15 | UI chrome (navigation, buttons) remains English regardless of Case or Dialog language |
 
 ---
 
@@ -618,3 +677,4 @@ MIN_INPUT_CHARS=500
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-05-15 | — | Initial MVP specification |
+| 1.1 | 2026-05-15 | — | Case language for Summary; adaptive Dialog language; English UI chrome only |
